@@ -39,6 +39,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <unistd.h>
+#include <ctype.h>
 
 #define LISTENQ 1
 #define MAXDATASIZE 100
@@ -207,6 +208,8 @@ int main (int argc, char **argv) {
             char* tag = strtok(recvline, " \r\n");
             char* command = strtok(NULL, " \r\n");
 
+            for (char *p = command ; *p; ++p) *p = toupper(*p);
+
             if (strcmp(command, "LOGIN") == 0){
               /* Realizar LOGIN do usuario */
               char* username = strtok(NULL, " \r\n");
@@ -249,6 +252,13 @@ int main (int argc, char **argv) {
               sprintf(response, "%s OK LOGOUT completed\n", tag);
               write(connfd, response, strlen(response));
               close(connfd);
+            }
+
+            else { /* Comando não reconhecido *q
+              /* Respondendo ao cliente */
+              char response[MAXSTRING];
+              sprintf(response, "%s BAD %s command unknown or arguments invalid\n", tag, command);
+              write(connfd, response, strlen(response));
             }
             //write(connfd, recvline, strlen(recvline));
          }
