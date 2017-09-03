@@ -40,6 +40,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <dirent.h>
 
 #define LISTENQ 1
 #define MAXDATASIZE 100
@@ -50,6 +51,21 @@
 #define NOT_AUTHENTICATED 0
 #define AUTHENTICATED 1
 #define SELECTED 2
+
+/* Flags dos emails - armazenado como vetor de booleans */
+#define MAXFLAGS 2
+#define SEEN 0
+#define DELETED 1
+
+/* Função que constroi uma resposta FLAGS baseado no vetor flags */
+char* build_flags_string(char* flags){
+  char* flags_string = malloc(sizeof(char) * 17);
+  strcpy(flags_string, "ERROR");
+  if (flags[SEEN] && !flags[DELETED]) strcpy(flags_string, "\\Seen");
+  if (!flags[SEEN] && flags[DELETED]) strcpy(flags_string, "\\Deleted");
+  if (flags[SEEN] && flags[DELETED]) strcpy(flags_string, "\\Seen \\Deleted");
+  return flags_string;
+} 
 
 /* Função que tenta realizar um login e retorna um booleano */
 char attempt_login(char* username, char* password){
@@ -81,6 +97,114 @@ char attempt_login(char* username, char* password){
       free(line);
 
   return result;
+}
+
+/* Struct que armazena as informações de uma mailbox aberta */
+typedef struct _mailbox
+{
+  char path[MAXSTRING];
+  int exists;
+  int unseen;
+  int recent;
+  char flags[MAXFLAGS];
+  char status;
+} mailbox;
+
+/* Função que seleciona uma mailbox, abre, e retorna
+ * as informações gerais */
+mailbox open_mailbox(char* mailbox_name, char* username){
+  /* Inicializando struct mailbox */
+  mailbox current_mailbox;
+  current_mailbox.exists = current_mailbox.recent = current_mailbox.status = 0;
+  current_mailbox.unseen = -1;
+  for (int i = 0; i < MAXFLAGS; i++) current_mailbox.flags[i] = 0;
+
+  /* Determinando o caminho para a mailbox (inbox = root) */
+  strcpy(current_mailbox.path, "server_data/");
+  strcat(current_mailbox.path, username);
+  strcat(current_mailbox.path, "/Maildir/");
+  if (strcmp(mailbox_name, "inbox") != 0){
+    strcat(current_mailbox.path, mailbox_name);
+    strcat(current_mailbox.path, "/");
+  }
+
+  /* new and cur paths */
+  char new_path[MAXSTRING];
+  strcpy(new_path, current_mailbox.path);
+  strcat(new_path, "new");
+  char cur_path[MAXSTRING];
+  strcpy(cur_path, current_mailbox.path);
+  strcat(cur_path, "cur");
+
+  /* Contando e movendo as mensagens na pasta "new" */
+  DIR* mailbox_new_directory = opendir(new_path);
+  struct dirent *new_ent;
+
+  /* Verificando se a pasta foi aberta com sucesso */
+  if (mailbox_new_directory){
+    /* Passeando por todos os arquivos na pasta */
+    while ((new_ent = readdir(mailbox_new_directory)) != NULL){
+      /* Ignorando outras pastas, inclusive '...' e '..' */
+      if (new_ent->d_type == DT_DIR) continue;
+
+      /* Contando mais uma mensagem recente */
+      current_mailbox.recent++;
+
+      /* Movendo para a pasta "cur" */
+      char source[MAXSTRING], destination[MAXSTRING];
+      strcpy(source, new_path);
+      strcat(source, "/");
+      strcat(source, new_ent->d_name);
+      strcpy(destination, cur_path);
+      strcat(destination, "/");
+      strcat(destination, new_ent->d_name);
+      strcat(destination, ":2,");
+      rename(source, destination);
+    }
+    closedir(mailbox_new_directory); /* Fechando ponteiro de pasta aberto */
+  } else{
+    /* aconteceu um erro, retornando uma struct com sinal de erro */
+    current_mailbox.status = -1;
+    return current_mailbox;
+  }
+
+  /* Contando e enumerando as mensagens na pasta "cur";
+   * também memorizando flags já vistas */
+  /* Abrindo a pasta 'cur' */
+  DIR* mailbox_cur_directory = opendir(cur_path);
+  struct dirent *cur_ent;
+
+  /* Verificando se a pasta foi aberta com sucesso */
+  if (mailbox_cur_directory){
+    /* Passeando por todos os arquivos na pasta */
+    while ((cur_ent = readdir(mailbox_cur_directory)) != NULL){
+      /* Ignorando outras pastas, inclusive '...' e '..' */
+      if (cur_ent->d_type == DT_DIR) continue;
+
+      /* Contando mais uma mensagem existente */
+      current_mailbox.exists++;
+
+      /* Separando flags do nome do arquivo */
+      char* info = strtok(cur_ent->d_name, ":");
+      info = strtok(NULL, ":\r\n");
+      if (strlen(info) <= 2)
+        if (current_mailbox.unseen < 0) current_mailbox.unseen = current_mailbox.exists - 1; /* Marcando primeira mensagem não vista */
+      if (strlen(info) > 2){
+        if (info[2] == 'S') current_mailbox.flags[SEEN] = 1;
+        else if (current_mailbox.unseen < 0) current_mailbox.unseen = current_mailbox.exists - 1; /* Marcando primeira mensagem não vista */
+        if (info[2] == 'T') current_mailbox.flags[DELETED] = 1;
+      } 
+      if (strlen(info) > 3) 
+        if (info[3] == 'T') current_mailbox.flags[DELETED] = 1;
+    }
+    closedir(mailbox_cur_directory); /* Fechando ponteiro de pasta aberto */
+  } else{
+    /* aconteceu um erro, retornando uma struct com sinal de erro */
+    current_mailbox.status = -1;
+    return current_mailbox;
+  }
+
+  return current_mailbox;
 }
 
 int main (int argc, char **argv) {
@@ -196,7 +320,19 @@ int main (int argc, char **argv) {
          char client_state = NOT_AUTHENTICATED;
          char logged_user[MAXSTRING]; /* Usuario atualmente autenticado */
 
+         mailbox current_mailbox; /* Mailbox atualmente aberta */
+         strcpy(current_mailbox.path, "#NONE");
+
          while ((n=read(connfd, recvline, MAXLINE)) > 0) {
+            /* Tratando comando vazio */
+            if (n <= 2){
+                /* Respondendo ao cliente */
+                char response[MAXSTRING];
+                sprintf(response, "* BAD empty command\n");
+                write(connfd, response, strlen(response));
+                continue;              
+            }
+
             recvline[n]=0;
             printf("[Cliente %d enviou:] ",getpid());
             if ((fputs(recvline,stdout)) == EOF) {
@@ -207,6 +343,14 @@ int main (int argc, char **argv) {
              /* Determinando qual o comando enviado */
             char* tag = strtok(recvline, " \r\n");
             char* command = strtok(NULL, " \r\n");
+
+            /* Tratando comandos mal formados */
+            if (tag == NULL || command == NULL){
+              /* Respondendo ao cliente */
+              char response[MAXSTRING];
+              sprintf(response, "* BAD malformed command\n");
+              write(connfd, response, strlen(response));
+            }
 
             for (char *p = command ; *p; ++p) *p = toupper(*p);
 
@@ -219,7 +363,7 @@ int main (int argc, char **argv) {
               if (username == NULL || password == NULL){ /* comando mal formado */
                 /* Respondendo ao cliente */
                 char response[MAXSTRING];
-                sprintf(response, "%s BAD LOGIN command unknown or arguments invalid\n", tag);
+                sprintf(response, "%s BAD LOGIN arguments invalid\n", tag);
                 write(connfd, response, strlen(response));
               } else {
                 /* Verificando se o usuário é válido */
@@ -252,6 +396,58 @@ int main (int argc, char **argv) {
               sprintf(response, "%s OK LOGOUT completed\n", tag);
               write(connfd, response, strlen(response));
               close(connfd);
+            }
+            else if (strcmp(command, "SELECT") == 0){
+              /* Selecionar uma das mailboxes disponíveis */
+              char* mailbox_name = strtok(NULL, " \r\n");
+
+              /* Verificando se o comando é válido */
+              if (mailbox_name == NULL){ /* comando mal formado */
+                /* Respondendo ao cliente */
+                char response[MAXSTRING];
+                sprintf(response, "%s BAD SELECT argument invalid\n", tag);
+                write(connfd, response, strlen(response));
+              } else if (client_state == NOT_AUTHENTICATED){ /* cliente não logado */
+                /* Respondendo ao cliente */
+                char response[MAXSTRING];
+                sprintf(response, "%s BAD SELECT unauthenticated user\n", tag);
+                write(connfd, response, strlen(response));
+              } else {
+
+                /* Abrir a mailbox e obter as informações */
+                current_mailbox = open_mailbox(mailbox_name, logged_user);
+
+                /* Verificação de erro na abertura da mailbox */
+                if (current_mailbox.status < 0){
+                  /* Respondendo ao cliente */
+                  printf("[Erro selecionando a mailbox %s do usuario %s no cliente %d]\n", mailbox_name, logged_user, getpid());
+                  char response[MAXSTRING];
+                  sprintf(response, "%s BAD SELECT mailbox directory error\n", tag);
+                  write(connfd, response, strlen(response));
+                }
+
+                /* Abrindo a mailbox no processo */
+                client_state = SELECTED;
+                printf("[Usuario \'%s\' selecionou a mailbox \'%s\' no cliente %d]\n", logged_user, mailbox_name, getpid());
+
+                /* Respondendo ao cliente */
+                char response[MAXSTRING];
+                sprintf(response, "* %d EXISTS\n", current_mailbox.exists);
+                write(connfd, response, strlen(response));
+                sprintf(response, "* %d RECENT\n", current_mailbox.recent);
+                write(connfd, response, strlen(response));
+                sprintf(response, "* OK [UNSEEN %d] message %d is first unseen\n", current_mailbox.unseen, current_mailbox.unseen);
+                write(connfd, response, strlen(response));
+                if (current_mailbox.flags[0] == 1 || current_mailbox.flags[1] == 1){
+                  char* flags_string = build_flags_string(current_mailbox.flags);
+                  sprintf(response, "* FLAGS (%s)\n", flags_string);
+                  write(connfd, response, strlen(response));
+                  free(flags_string);
+                }
+                sprintf(response, "%s OK [READ-WRITE] SELECT completed\n", tag);
+                write(connfd, response, strlen(response));
+                
+              }
             }
 
             else { /* Comando não reconhecido *q
